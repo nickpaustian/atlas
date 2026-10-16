@@ -1,0 +1,64 @@
+{
+  "name": "@nickpaustian/atlas",
+  "version": "0.1.0",
+  "description": "Virtual texturing for three.js: stream tiles of very large images into a fixed-size atlas on demand",
+  "type": "module",
+  "license": "MIT",
+  "author": "Nicholas Paustian",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nickpaustian/atlas.git"
+  },
+  "homepage": "https://github.com/nickpaustian/atlas#readme",
+  "bugs": "https://github.com/nickpaustian/atlas/issues",
+  "keywords": [
+    "three",
+    "virtual-texture",
+    "virtual-texturing",
+    "megatexture",
+    "streaming",
+    "webgl2",
+    "texture",
+    "tiles"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "tools",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepack": "npm run build"
+  },
+  "bin": {
+    "atlas": "tools/cli.mjs"
+  },
+  "peerDependencies": {
+    "three": ">=0.159.0 <0.170.0"
+  },
+  "dependencies": {
+    "sharp": "^0.35.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.2",
+    "three": "^0.164.1",
+    "@types/three": "^0.164.1"
+  }
+}
