@@ -109,6 +109,7 @@ const channels = {}
 await Promise.all(channelNames.map(async (name) => { channels[name] = await loadTileSource("/asset/" + name) }))
 const vt = new VirtualTexture({ channels, flipV: true, atlasSize: Number(params.get("atlasSize")) || ${Number(option("atlasSize", 4096))} })
 window.atlas = vt
+window.atlasPreview = { renderer, scene, camera, controls, THREE }
 const { manifest } = vt
 
 // A flat plane trimmed to the real image inside the padded virtual texture

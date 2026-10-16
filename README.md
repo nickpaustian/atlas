@@ -169,9 +169,10 @@ npm ci
 npm test            # vitest: page keys, page table, the tile scheduler against a hand-driven fetch, the tools on a generated image
 npm run typecheck
 npm run build       # dist/
+npm run smoke       # headless Chromium through Playwright: the preview on a generated pyramid, tiles resident, level 0 reached, texture visible, detail cap
 ```
 
-CI runs typecheck, tests and build against three r159, r164 and r169 on every push and pull request, and publishes to npm with provenance on a `v*` tag.
+CI runs typecheck, tests and build against three r159, r164 and r169, and the smoke suite once in Chromium, on every push and pull request, and publishes to npm with provenance on a `v*` tag.
 
 ## Licence
 
