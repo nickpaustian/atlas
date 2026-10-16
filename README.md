@@ -162,6 +162,17 @@ Both use the same ramp, `levelColor(t)` in JS and `atlasLevelColor(t)` in GLSL.
 - On a lost WebGL context three restores the empty atlas, not the tiles; residency should be reset by recreating the `VirtualTexture`.
 - The tile format may change before 1.0.
 
+## Development
+
+```
+npm ci
+npm test            # vitest: page keys, page table, the tile scheduler against a hand-driven fetch, the tools on a generated image
+npm run typecheck
+npm run build       # dist/
+```
+
+CI runs typecheck, tests and build against three r159, r164 and r169 on every push and pull request, and publishes to npm with provenance on a `v*` tag.
+
 ## Licence
 
 MIT.
