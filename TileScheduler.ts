@@ -14,6 +14,12 @@ export interface SchedulerOptions {
   abortBelow?: number
   // Frames to wait before re-requesting a tile the cache could not take
   cooldownFrames?: number
+  // With a pool: rank tiles by priority per byte of the tile rather than by priority alone, so a
+  // small tile that closes as much of a gap as a large one goes first and a pool shared with
+  // Theia can weigh tiles against pages by the same measure. A tile's size is the mean of those
+  // received at its level on its channel, `expectedTileBytes` until one has
+  valuePerByte?: boolean
+  expectedTileBytes?: number
 }
 
 export interface SchedulerStats {
@@ -56,6 +62,10 @@ export default class TileScheduler {
   private abortBelow: number
   private cooldownFrames: number
   private pool: PoolClient | null
+  private valuePerByte: boolean
+  private expectedTileBytes: number
+  // Bytes received per channel, and per level within it, so a tile's size can be guessed
+  private received: Map<AtlasChannel, { bytes: number; tiles: number; levels: Array<{ bytes: number; tiles: number }> }> = new Map()
 
   private queue: Map<string, ScheduledTile> = new Map()
   private inFlight: Map<string, ScheduledTile> = new Map()
@@ -75,7 +85,11 @@ export default class TileScheduler {
     graceMs = 250,
     abortBelow = 0.5,
     cooldownFrames = 30,
+    valuePerByte = false,
+    expectedTileBytes = 16384,
   }: SchedulerOptions = {}) {
+    this.valuePerByte = valuePerByte
+    this.expectedTileBytes = expectedTileBytes
     this.concurrency = concurrency
     this.graceMs = graceMs
     this.abortBelow = abortBelow
@@ -175,13 +189,25 @@ export default class TileScheduler {
     }
   }
 
+  // Mean bytes of the tiles received at a level of a channel; the channel's mean, then the
+  // expected size, until one has
+  public tileBytes(channel: AtlasChannel, level: number): number {
+    const r = this.received.get(channel)
+    if (!r) return this.expectedTileBytes
+    const l = r.levels[level]
+    if (l && l.tiles > 0) return l.bytes / l.tiles
+    return r.tiles > 0 ? r.bytes / r.tiles : this.expectedTileBytes
+  }
+
   // Every queued tile holds a pool ticket with its priority as a fraction of the most wanted
   // tile; the pool starts them in its own order and the tile moves to inFlight then
   private pumpPooled(pool: PoolClient): void {
     let max = 0
     for (const tile of this.queue.values()) if (Number.isFinite(tile.priority)) max = Math.max(max, tile.priority)
     for (const tile of this.queue.values()) {
-      const priority = Number.isFinite(tile.priority) ? (max > 0 ? tile.priority / max : 1) : 1
+      const priority = this.valuePerByte
+        ? Math.min(tile.priority, Number.MAX_VALUE) / this.tileBytes(tile.channel, pageLevel(tile.key))
+        : Number.isFinite(tile.priority) ? (max > 0 ? tile.priority / max : 1) : 1
       if (tile.ticket) {
         tile.ticket.setPriority(priority)
         continue
@@ -231,6 +257,13 @@ export default class TileScheduler {
       }
       this.completed++
       this.bytes += tile.received
+      const r = this.received.get(channel) ?? { bytes: 0, tiles: 0, levels: [] }
+      r.bytes += tile.received
+      r.tiles++
+      const level = (r.levels[pageLevel(key)] ??= { bytes: 0, tiles: 0 })
+      level.bytes += tile.received
+      level.tiles++
+      this.received.set(channel, r)
       this.loadedNotTaken.add(tile.id)
       channel.loaded.push({ key, image })
     } catch (error) {

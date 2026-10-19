@@ -14,15 +14,19 @@ const makeLevel = (cols: number, rows: number) => ({ data: new Uint8Array(cols *
 type MipLevel = ReturnType<typeof makeLevel>
 // The indirection texture. One mip level per page level; each texel is the atlas slot of
 // the finest resident page covering that virtual page, at that level or coarser:
-// r = slot x, g = slot y, b = level the slot holds, a = 255 when anything covers it.
+// r = slot x, g = slot y, b = level the slot holds, a = how far the page has faded in
+// (1..255; 0 where nothing covers it). While a page fades, the entry one level above it still
+// names the page it replaced, so the shader can blend the two.
 export default class PageTable {
   public readonly texture: THREE.DataTexture
   public readonly levels: MipLevel[] = []
 
   private manifest: TileManifest
   private slotsPerRow: number
-  private resident: Map<PageKey, number> = new Map()
+  private resident: Map<PageKey, { slot: number; arrivedAt: number }> = new Map()
   private dirty: boolean = true
+  // Pages whose fade was still running at the last update, so the next one re-uploads
+  private fading: number = 0
 
   constructor(manifest: TileManifest, slotsPerRow: number) {
     this.manifest = manifest
@@ -66,8 +70,9 @@ export default class PageTable {
     return this.levels.reduce((n, level) => n + level.data.byteLength, 0)
   }
 
-  public setResident(key: PageKey, slot: number): void {
-    this.resident.set(key, slot)
+  // `now` starts the page's fade; left out, the page is shown at once
+  public setResident(key: PageKey, slot: number, now: number = -Infinity): void {
+    this.resident.set(key, { slot, arrivedAt: now })
     this.dirty = true
   }
 
@@ -91,10 +96,12 @@ export default class PageTable {
   }
 
   // Fills every level from the coarsest down, so a page with no tile of its own inherits
-  // its parent's entry. Returns true when the texture was re-uploaded.
-  public update(): boolean {
-    if (!this.dirty) return false
+  // its parent's entry. A page younger than `fadeMs` carries its progress in alpha and keeps
+  // the table updating until it is whole. Returns true when the texture was re-uploaded.
+  public update(now: number = Infinity, fadeMs: number = 0): boolean {
+    if (!this.dirty && this.fading === 0) return false
     this.dirty = false
+    this.fading = 0
 
     for (let level = this.manifest.levels - 1; level >= 0; level--) {
       const { data, width, height } = this.levels[level]
@@ -103,13 +110,16 @@ export default class PageTable {
       for (let y = 0; y < height; y++) {
         for (let x = 0; x < width; x++) {
           const offset = (y * width + x) * 4
-          const slot = this.resident.get(pageKey(level, x, y))
+          const page = this.resident.get(pageKey(level, x, y))
 
-          if (slot !== undefined) {
-            data[offset] = slot % this.slotsPerRow
-            data[offset + 1] = Math.floor(slot / this.slotsPerRow)
+          if (page !== undefined) {
+            const age = now - page.arrivedAt
+            const progress = fadeMs > 0 && age < fadeMs ? age / fadeMs : 1
+            if (progress < 1) this.fading++
+            data[offset] = page.slot % this.slotsPerRow
+            data[offset + 1] = Math.floor(page.slot / this.slotsPerRow)
             data[offset + 2] = level
-            data[offset + 3] = 255
+            data[offset + 3] = Math.max(1, Math.round(progress * 255))
           } else if (parent) {
             const parentOffset = ((y >> 1) * parent.width + (x >> 1)) * 4
             data[offset] = parent.data[parentOffset]

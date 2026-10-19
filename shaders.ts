@@ -29,19 +29,30 @@ vec3 atlasLevelColor( float t ) {
   return vec3( min( 1.0, t * 2.0 ), min( 1.0, ( 1.0 - t ) * 2.0 ), 0.0 );
 }
 
-// Looks a channel up at a page level: page table entry, then the slot it names in the cache
-vec4 atlasFetch( sampler2D pageTable, sampler2D cache, vec2 grid, vec4 cacheParams, vec4 fallback, float level, vec2 uv, float tintMaxLevel ) {
-  vec2 uvTop = vec2( uv.x, mix( uv.y, 1.0 - uv.y, atlasFlipV ) );
-  vec4 entry = texture2DLodEXT( pageTable, uvTop, level );
-  if ( entry.a < 0.5 ) return fallback;
-
+// The texel of the cache slot a page table entry names, at the page's own level
+vec4 atlasSlotTexel( sampler2D cache, vec2 grid, vec4 cacheParams, vec4 entry, vec2 uvTop ) {
   float residentLevel = entry.b * 255.0;
   vec2 slot = entry.rg * 255.0;
   vec2 pages = max( floor( grid / exp2( residentLevel ) ), vec2( 1.0 ) );
   vec2 inPage = fract( uvTop * pages );
-
   vec2 texel = slot * cacheParams.x + cacheParams.y + inPage * cacheParams.z;
-  vec4 color = texture2D( cache, texel / cacheParams.w );
+  return texture2D( cache, texel / cacheParams.w );
+}
+
+// Looks a channel up at a page level: page table entry, then the slot it names in the cache.
+// A page still fading in (alpha below 1) is blended with the coarser page it replaced, which
+// the table one level above the resident one still names.
+vec4 atlasFetch( sampler2D pageTable, sampler2D cache, vec2 grid, vec4 cacheParams, vec4 fallback, float level, float maxLevel, vec2 uv, float tintMaxLevel ) {
+  vec2 uvTop = vec2( uv.x, mix( uv.y, 1.0 - uv.y, atlasFlipV ) );
+  vec4 entry = texture2DLodEXT( pageTable, uvTop, level );
+  if ( entry.a <= 0.0 ) return fallback;
+
+  float residentLevel = entry.b * 255.0;
+  vec4 color = atlasSlotTexel( cache, grid, cacheParams, entry, uvTop );
+  if ( entry.a < 1.0 && residentLevel < maxLevel ) {
+    vec4 previous = texture2DLodEXT( pageTable, uvTop, residentLevel + 1.0 );
+    if ( previous.a > 0.0 ) color = mix( atlasSlotTexel( cache, grid, cacheParams, previous, uvTop ), color, entry.a );
+  }
   if ( tintMaxLevel >= 0.0 && atlasDebugTint > 0.5 ) {
     float shown = residentLevel;
     #ifdef ATLAS_TRI_TINT
@@ -70,7 +81,7 @@ vec4 atlasSample_${name}( vec2 uv ) {
   float level = clamp( floor( atlasLod( uv ) ) - atlas_${name}_params.z, atlas_${name}_params.y, atlas_${name}_params.x );
   return atlasFetch(
     atlas_${name}_pageTable, atlas_${name}_cache, atlas_${name}_grid, atlas_${name}_cacheParams, atlas_${name}_fallback,
-    level, uv, ${tinted ? `atlas_${name}_params.x` : "-1.0"}
+    level, atlas_${name}_params.x, uv, ${tinted ? `atlas_${name}_params.x` : "-1.0"}
   );
 }
 `

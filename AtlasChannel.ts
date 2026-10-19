@@ -70,6 +70,8 @@ export default class AtlasChannel {
   public readonly uniforms: Record<string, THREE.IUniform>
   // How many levels coarser than the reference this channel's level 0 is
   public readonly offset: number
+  // Milliseconds a landed page dissolves in over the page it replaced; may be changed live
+  public fadeMs: number = 250
   // Cap from maxSize: the finest level this channel ever streams
   private readonly capLevel: number
   private detailCapLevels: number = 0
@@ -159,15 +161,19 @@ export default class AtlasChannel {
     return covering === -1 ? this.maxLevel + 1 : pageLevel(covering)
   }
 
+  // Moves downloaded tiles into slots, at most `budget` this frame and at least one, stopping
+  // past `deadline`; re-uploads the page table if residency changed or a page is still fading
   public uploadLoaded(
     renderer: THREE.WebGLRenderer,
     scheduler: TileScheduler,
     frame: number,
     minIdleFrame: number,
-    budget: number
+    budget: number,
+    now: number = performance.now(),
+    deadline: number = Infinity
   ): number {
     let uploads = 0
-    while (uploads < budget) {
+    while (uploads < budget && (uploads === 0 || performance.now() < deadline)) {
       const page = this.loaded.shift()
       if (!page) break
       const { key, image } = page
@@ -181,12 +187,12 @@ export default class AtlasChannel {
       }
       if (allocation.evicted !== -1) this.pageTable.setEvicted(allocation.evicted)
       this.cache.upload(renderer, allocation.slot, image)
-      this.pageTable.setResident(key, allocation.slot)
+      this.pageTable.setResident(key, allocation.slot, now)
       image.close()
       uploads++
       this.totalUploads++
     }
-    this.pageTable.update()
+    this.pageTable.update(now, this.fadeMs)
     return uploads
   }
 

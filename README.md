@@ -79,10 +79,15 @@ Any built-in material works: `attach` expands the three chunk that samples each 
 | `feedbackScale` | 8 | the feedback target is the viewport divided by this in each axis |
 | `feedbackInterval` | 2 | frames between feedback passes |
 | `uploadsPerFrame` | 8 | atlas uploads per frame per channel |
+| `uploadBudgetMs` | 2 | milliseconds of main-thread time a frame may spend on uploads across the channels; at least one tile lands a frame on each, the rest wait their turn, so a burst after a zoom cannot stall a frame |
+| `fadeMs` | 250 | milliseconds a landed tile dissolves in over the page it replaced, so a level change is a blend rather than a pop; `0` switches at once. A live field |
+| `budget` | true | when a channel's atlas is full and pages are still wanted, pick coarser pages (a bias on top of `lodBias`, half a level at a time, every 600 ms) until the cut fits, and ease it back a quarter at a time as room returns, so a small atlas shows a coarser whole rather than the finest level in a patch |
 | `scheduler.concurrency` | 6 | parallel tile fetches across all channels; ignored when `pool` is set |
 | `scheduler.graceMs` | 250 | how long a tile may be unwanted before its fetch is aborted |
 | `scheduler.abortBelow` | 0.5 | fetches past this fraction downloaded are left to finish |
 | `scheduler.cooldownFrames` | 30 | frames before re-requesting a tile the cache could not take |
+| `scheduler.valuePerByte` | false | with `pool`: rank tiles by priority per byte of the tile rather than by priority alone, so a small tile that closes as much of a gap as a large one goes first and a pool shared with Theia weighs tiles against pages by one measure. A tile's size is the mean received at its level on its channel |
+| `scheduler.expectedTileBytes` | 16384 | the size assumed for a level until a tile of it has arrived |
 | `pool` | none | a client of a shared fetch pool ([Tethys](https://github.com/nickpaustian/tethys)); the pool then owns the connection budget |
 
 A channel entry is either a `TileSource` or:
@@ -134,7 +139,7 @@ The `atlas` command runs from the package (`npx atlas`, or on the path after a g
 
 ## Stats and debugging
 
-`vt.stats` reports, per frame: resident pages and capacity across channels, pending and requested pages, uploads, failures, GPU memory, the current `detailCap`, a per-channel breakdown (resident, capacity, uploads, dropped, `minLevel`, atlas size, memory) and the network counters (queued, in flight, completed, aborted, failures, bytes).
+`vt.stats` reports, per frame: resident pages and capacity across channels, pending and requested pages, uploads, failures, GPU memory, the current `detailCap` and `budgetLodBias`, a per-channel breakdown (resident, capacity, uploads, dropped, `minLevel`, atlas size, memory) and the network counters (queued, in flight, completed, aborted, failures, bytes).
 
 - `vt.debugTint = 1` tints every pixel by the level it draws from, green for level 0 through red for the coarsest, keeping the texture's luminance so the image stays readable. `vt.debugTint = 2` paints each triangle flat with the level its centroid draws from (needs `triangleTint` on attach). `vt.cycleDebugTint()` steps off, pixel, triangle.
 - `new AtlasDebugOverlay(vt)` adds a fixed-position panel: the virtual texture unwrapped with each level-0 page coloured by the level it currently draws from and resident pages outlined at their own size, the content rect, the atlas slot occupancy, and a legend of levels with texel sizes and resident counts. Call `overlay.update()` each frame and `toggle()` to show it.
@@ -146,16 +151,16 @@ Both use the same ramp, `levelColor(t)` in JS and `atlasLevelColor(t)` in GLSL.
 1. **Tile pyramid** (offline). The build tool writes the padded pyramid described above.
 2. **Feedback pass** (every `feedbackInterval` frames). The attached meshes are rendered alone at `1/feedbackScale` resolution with a shader that outputs, per pixel, the page it wants: page x, page y and mip level, derived from the screen-space derivatives of the virtual UVs. The result is read back and decoded into a set of page keys.
 3. **Scheduler.** One queue for every channel with a shared concurrency budget. Each feedback pass restates what is wanted; anything not restated is dropped from the queue, and an in-flight fetch that stays unwanted past a grace period is aborted unless it is already mostly downloaded. A page's priority is its screen coverage, times the square of the quality gap it would close, times closeness to the screen centre, so a region drawing three levels too coarse outranks one drawing one level too coarse. An ancestor accumulates the coverage of every wanted page beneath it, so it wins while nothing covers that area and loses once a reasonable fallback is resident. Requests are capped to the slots the channel's cache can give, and a tile the cache could not take is not asked for again for a cooldown. Bodies are streamed so progress is known, direct pages use the fetch priority hint `high` and ancestors `low`, and tiles are decoded with `createImageBitmap`.
-4. **Page cache.** A square atlas of equal slots. Loaded tiles are uploaded into a slot with `texSubImage2D` on the raw context, which touches nothing else. Slots are reused least-recently-used first, and the root page is never evicted.
-5. **Page table.** One mip level per page level. Each texel names the atlas slot of the finest resident page covering that virtual page, at that level or coarser. It is rebuilt on the CPU whenever residency changes and re-uploaded as a tiny data texture with explicit mip levels.
-6. **Sampling.** The material shader computes the desired level, looks up the page table at that level with `textureLod`, then samples the atlas inside the slot it names. A page with no tile of its own inherits its parent's slot, so there is always something to draw once the root has landed.
+4. **Page cache.** A square atlas of equal slots. Loaded tiles are uploaded into a slot with `texSubImage2D` on the raw context, which touches nothing else, as many a frame as the upload budget allows. Slots are reused least-recently-used first, and the root page is never evicted. When the atlas stays full while pages are still wanted, the level asked for is biased coarser until the cut fits, and eased back as room returns.
+5. **Page table.** One mip level per page level. Each texel names the atlas slot of the finest resident page covering that virtual page, at that level or coarser, with how far that page has faded in since it landed in alpha. It is rebuilt on the CPU whenever residency changes or a page is still fading, and re-uploaded as a tiny data texture with explicit mip levels.
+6. **Sampling.** The material shader computes the desired level, looks up the page table at that level with `textureLod`, then samples the atlas inside the slot it names. A page with no tile of its own inherits its parent's slot, so there is always something to draw once the root has landed. A page still fading in is blended with the page it replaced, which the table one level above still names, so a level change dissolves rather than pops.
 
 ## Limitations
 
 - WebGL 2 only.
 - One `VirtualTexture` per object, and one UV set. Packing several images into one virtual canvas is a build-time job.
 - Page coordinates travel through an RGBA8 feedback target, so a level can have at most 256 pages a side (65 536 texels at 256 px tiles).
-- No trilinear blend between levels; a level change is a hard switch, softened only by the border filtering.
+- No trilinear blend between levels: a level change dissolves over `fadeMs` and is then a hard switch, softened only by the border filtering.
 - Meshes that are not attached are hidden during the feedback pass, so geometry occluding a virtual-textured surface does not stop its tiles being requested.
 - The feedback readback is synchronous. The target is small, but it still stalls the pipeline on the frames it runs.
 - Tiles keep alpha. An image cut out on a transparent background needs a material with `transparent: true` or an `alphaTest`, or the margin draws black.
@@ -166,7 +171,7 @@ Both use the same ramp, `levelColor(t)` in JS and `atlasLevelColor(t)` in GLSL.
 
 ```
 npm ci
-npm test            # vitest: page keys, page table, the tile scheduler against a hand-driven fetch, the tools on a generated image
+npm test            # vitest: page keys, the page table and its fade, the tile scheduler against a hand-driven fetch (ranking by value per byte too), the tools on a generated image
 npm run typecheck
 npm run build       # dist/
 npm run smoke       # headless Chromium through Playwright: the preview on a generated pyramid, tiles resident, level 0 reached, texture visible, detail cap

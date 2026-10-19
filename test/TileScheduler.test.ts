@@ -121,6 +121,27 @@ describe("TileScheduler", () => {
     expect(channel.loaded.length).toBe(1)
   })
 
+  it("ranks pooled tiles by priority per byte from the sizes received at each level", async () => {
+    const { fetch, calls } = fakeFetch()
+    const { client, waiting, startBest } = fakePool()
+    const channel = channelWith(fetch)
+    const scheduler = new TileScheduler({ pool: client, valuePerByte: true, expectedTileBytes: 1000 })
+    scheduler.want(channel, pageKey(0, 0, 0), 2, true, 1)
+    scheduler.endPass(1)
+    expect(waiting[0].priority).toBe(0.002)
+    const run = startBest()
+    calls[0].respond({ headers: { "content-length": "4000" } })
+    calls[0].push(new Uint8Array(4000))
+    calls[0].close()
+    await run
+    expect(scheduler.tileBytes(channel, 0)).toBe(4000)
+    expect(scheduler.tileBytes(channel, 1)).toBe(4000)
+    scheduler.want(channel, pageKey(0, 1, 0), 2, true, 2)
+    scheduler.want(channel, pageKey(1, 0, 0), 2, true, 2)
+    scheduler.endPass(2)
+    expect(waiting.map((e) => e.priority)).toEqual([0.0005, 0.0005])
+  })
+
   it("aborts everything in flight and cancels tickets on dispose", () => {
     const { fetch, calls } = fakeFetch()
     const channel = channelWith(fetch)

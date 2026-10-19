@@ -47,6 +47,15 @@ export interface VirtualTextureOptions {
   flipV?: boolean
   // Tile uploads per frame per channel, to spread the cost
   uploadsPerFrame?: number
+  // Milliseconds of main-thread time a frame may spend on uploads across the channels; at
+  // least one tile lands a frame on each
+  uploadBudgetMs?: number
+  // Milliseconds a landed tile dissolves in over the page it replaced; 0 switches at once
+  fadeMs?: number
+  // When a channel's atlas is full and pages are still wanted, pick coarser pages (a lod bias
+  // on top of `lodBias`, half a level at a time) until the cut fits, and ease back as room
+  // returns; see the budgetLodBias stat
+  budget?: boolean
   // Network: shared concurrency, abort grace and progress threshold, drop cooldown
   scheduler?: SchedulerOptions
   // A client of a shared fetch pool (@nickpaustian/tethys), when Atlas streams alongside other modules
@@ -65,6 +74,8 @@ export interface VirtualTextureStats {
   network: SchedulerStats
   memoryBytes: number
   detailCap: number
+  // The budget's bias in levels, on top of the texture's own
+  budgetLodBias: number
 }
 
 const isTileSource = (input: ChannelInput): input is TileSource => "manifest" in input
@@ -83,12 +94,18 @@ export default class VirtualTexture {
 
   public feedbackInterval: number
   public uploadsPerFrame: number
+  public uploadBudgetMs: number
+  public budget: boolean
 
   private frame: number = 0
   private pass: number = 0
   private lastRequested: number = 0
   private detailCapLevels: number = 0
   private centreBias: number
+  private ownLodBias: number
+  private budgetBias: number = 0
+  private lastBudget: number = 0
+  private uploadsAtBudget: number = 0
 
   constructor({
     source,
@@ -101,12 +118,18 @@ export default class VirtualTexture {
     detailCap = 0,
     flipV = true,
     uploadsPerFrame = 8,
+    uploadBudgetMs = 2,
+    fadeMs = 250,
+    budget = true,
     scheduler = {},
     pool,
   }: VirtualTextureOptions) {
     this.feedbackInterval = feedbackInterval
     this.uploadsPerFrame = uploadsPerFrame
+    this.uploadBudgetMs = uploadBudgetMs
+    this.budget = budget
     this.centreBias = centreBias
+    this.ownLodBias = lodBias
 
     const inputs: Partial<Record<ChannelName, ChannelInput>> = { ...channels }
     if (source) inputs.map = source
@@ -123,10 +146,9 @@ export default class VirtualTexture {
     this.manifest = reference.options.source.manifest
 
     for (const { name, options: channelOptions } of options) {
-      this.channels.set(
-        name,
-        new AtlasChannel(name, channelOptions, this.manifest, atlasSize)
-      )
+      const channel = new AtlasChannel(name, channelOptions, this.manifest, atlasSize)
+      channel.fadeMs = fadeMs
+      this.channels.set(name, channel)
     }
     this.reference = this.channels.get(reference.name)!
 
@@ -208,13 +230,34 @@ export default class VirtualTexture {
     )
   }
 
+  // The texture's own bias; what is drawn and requested with adds the budget's
   public set lodBias(bias: number) {
+    this.ownLodBias = bias
+    this.applyLodBias()
+  }
+
+  public get lodBias(): number {
+    return this.ownLodBias
+  }
+
+  // The budget's bias in levels, on top of the texture's own
+  public get budgetLodBias(): number {
+    return this.budgetBias
+  }
+
+  private applyLodBias(): void {
+    const bias = this.ownLodBias + this.budgetBias
     this.uniforms.atlasLodBias.value = bias
     this.feedback.setLodBias(bias)
   }
 
-  public get lodBias(): number {
-    return this.uniforms.atlasLodBias.value as number
+  // Milliseconds a landed tile dissolves in over the page it replaced, on every channel
+  public set fadeMs(ms: number) {
+    for (const channel of this.channels.values()) channel.fadeMs = ms
+  }
+
+  public get fadeMs(): number {
+    return this.reference.fadeMs
   }
 
   // Tints the map channel by the level drawn from (green finest, red coarsest):
@@ -255,9 +298,13 @@ export default class VirtualTexture {
       this.collectRequests(this.feedback.render(renderer, scene, camera, this.meshes))
     }
 
+    // Each upload reads a tile's pixels and writes them, a fraction of a millisecond; a burst
+    // after a zoom is spread over frames by the budget
     const minIdleFrame = this.minIdleFrame
+    const now = performance.now()
+    const deadline = now + this.uploadBudgetMs
     for (const channel of this.channels.values()) {
-      channel.uploadLoaded(renderer, this.scheduler, this.frame, minIdleFrame, this.uploadsPerFrame)
+      channel.uploadLoaded(renderer, this.scheduler, this.frame, minIdleFrame, this.uploadsPerFrame, now, deadline)
     }
   }
 
@@ -291,6 +338,8 @@ export default class VirtualTexture {
     }
 
     const minIdleFrame = this.minIdleFrame
+    let unmet = 0
+    let pending = 0
     for (const channel of this.channels.values()) {
       const wants = new Map<PageKey, Demand>()
       for (const [key, entry] of reference) {
@@ -320,9 +369,33 @@ export default class VirtualTexture {
       for (const candidate of candidates.slice(0, Math.max(0, budget))) {
         this.scheduler.want(channel, candidate.key, candidate.priority, candidate.direct, this.pass)
       }
+      unmet += Math.max(0, candidates.length - Math.max(0, budget))
+      pending += pendingHere
     }
 
     this.scheduler.endPass(this.pass)
+    this.adjustBudget(unmet, pending, minIdleFrame)
+  }
+
+  // Judged every 600 ms, longer than a page's protection: the bias rises half a level while
+  // pages are wanted that no slot can take and nothing was placed since the last decision, and
+  // eases back a quarter at a time once nothing is unmet or in flight and a tenth of the
+  // reference atlas is free
+  private adjustBudget(unmet: number, pending: number, minIdleFrame: number): void {
+    const now = performance.now()
+    if (!this.budget || now - this.lastBudget < 600) return
+    const uploads = [...this.channels.values()].reduce((n, c) => n + c.stats.uploads, 0)
+    const placed = uploads - this.uploadsAtBudget
+    this.uploadsAtBudget = uploads
+    this.lastBudget = now
+    const cache = this.reference.cache
+    let bias = this.budgetBias
+    if (unmet > 0 && placed === 0) bias = Math.min(4, bias + 0.5)
+    else if (unmet === 0 && pending === 0 && bias > 0 && cache.availableSlots(minIdleFrame, (k) => k === this.reference.root) > cache.capacity * 0.1) bias = Math.max(0, bias - 0.25)
+    if (bias !== this.budgetBias) {
+      this.budgetBias = bias
+      this.applyLodBias()
+    }
   }
 
   // 1 at the centre falling to 1 / (1 + 0.25 · centreBias) at the corners
@@ -348,6 +421,7 @@ export default class VirtualTexture {
       network,
       memoryBytes: sum((c) => c.memoryBytes),
       detailCap: this.detailCapLevels,
+      budgetLodBias: this.budgetBias,
     }
   }
 
